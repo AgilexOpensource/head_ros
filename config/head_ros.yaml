@@ -1,0 +1,12 @@
+# /**/head_node matches head_node in any namespace.
+/**/head_node:
+  ros__parameters:
+    module_key: head
+    can_channel: can0
+    auto_configure: true
+    auto_enable: true
+    feedback_rate: 100.0
+    status_rate: 2.0
+    status_timeout: 2.0
+    control_mode: pos
+    control_enabled: true
