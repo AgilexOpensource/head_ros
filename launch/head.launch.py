@@ -12,10 +12,7 @@ def _launch_setup(context, *args, **kwargs):
     overrides = {}
 
     yaml_path = LaunchConfiguration("yaml_path").perform(context).strip()
-    if not yaml_path:
-        share = get_package_share_directory("head_ros")
-        overrides["yaml_path"] = os.path.join(share, "config", "head.yaml")
-    else:
+    if yaml_path:
         overrides["yaml_path"] = yaml_path
 
     module_key = LaunchConfiguration("module_key").perform(context).strip()
@@ -45,8 +42,8 @@ def _launch_setup(context, *args, **kwargs):
 
     return [
         Node(
-            package="motor_ros",
-            executable="motor_node",
+            package="head_ros",
+            executable="head_node",
             name="head_node",
             namespace=LaunchConfiguration("namespace"),
             output="screen",
@@ -69,12 +66,12 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 "yaml_path",
                 default_value="",
-                description="Head motor YAML (empty = head_ros/config/head.yaml).",
+                description="Head YAML path (empty = use params_file).",
             ),
             DeclareLaunchArgument(
                 "can_channel",
                 default_value="",
-                description="Override CAN channel (empty = use head YAML).",
+                description="Override CAN channel (empty = use params_file / head YAML).",
             ),
             DeclareLaunchArgument(
                 "module_key",

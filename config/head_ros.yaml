@@ -1,6 +1,7 @@
 # /**/head_node matches head_node in any namespace.
 /**/head_node:
   ros__parameters:
+    yaml_path: head.yaml
     module_key: head
     can_channel: can0
     auto_configure: true
@@ -10,3 +11,5 @@
     status_timeout: 2.0
     control_mode: pos
     control_enabled: true
+    # Delay (s) between per-joint enable/disable frames so boards do not drop back-to-back frames.
+    enable_interval: 0.1
