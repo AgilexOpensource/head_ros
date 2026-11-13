@@ -323,7 +323,7 @@ def test_startup_defaults_timers_and_readonly_contract(head_node, monkeypatch):
     calls = prepare_startup(head_node, monkeypatch)
     node = head_node.HeadRosNode()
     assert calls == ["connect", "configure", "enable:0.1"]
-    assert [period for period, callback in node.timers] == [0.01, 0.5]
+    assert [period for period, callback in node.timers] == [0.01, 1.0 / 30.0]
     for name in (
         "yaml_path", "module_key", "can_channel", "auto_configure", "auto_enable",
         "feedback_rate", "status_rate", "status_timeout", "control_enabled",

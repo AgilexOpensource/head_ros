@@ -16,7 +16,7 @@
 | `control_enabled` | `true` | 初始指令门控 |
 | `control_mode` | `pos` | `pos` 或 `mit`；可在运行时修改 |
 | `feedback_rate` | `100.0` | 关节反馈频率，Hz |
-| `status_rate` | `2.0` | 诊断频率，Hz |
+| `status_rate` | `30.0` | 诊断频率，Hz |
 | `status_timeout` | `2.0` | 诊断新鲜度上限，s |
 | `enable_interval` | `0.1` | 逐关节使能或失能帧之间的间隔，s |
 
@@ -91,6 +91,8 @@ current_a = torque_limit / (torque_k * torque_b)
 - 任一故障或保护位置位时为 `ERROR`，消息中列出这些位。
 - 新鲜且无故障时为 `OK`，消息为 `enabled` 或 `disabled`。
 - 时间戳缺失、非正、在未来或已过期时为 `STALE`，值为 `unknown`。新鲜指按主机挂钟时间 `0 <= age <= status_timeout`。
+
+30 Hz 诊断仅重复发布缓存的低速反馈，不会产生新的硬件采样或改变固件 CAN 发送频率。新鲜度仍按源时间戳判断，默认 2 秒超时保持不变。
 
 ## 运行边界
 
