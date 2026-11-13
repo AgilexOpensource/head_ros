@@ -2,7 +2,7 @@
 
 [中文](reference.zh-CN.md)
 
-Parameters, hardware YAML, diagnostics and operating boundaries of `head_node`. Start with the [README](../README.md).
+Parameters, launch arguments, command rules, hardware YAML, diagnostics, operating boundaries and troubleshooting of `head_node`. Start with the [README](../README.md).
 
 ## ROS parameters
 
@@ -23,7 +23,37 @@ Parameters, hardware YAML, diagnostics and operating boundaries of `head_node`. 
 - Rates and `status_timeout` must be finite and greater than 0; `enable_interval` must be finite and at least 0.
 - All parameters except `control_mode` are read-only after startup.
 - `control_enabled` keeps its startup value; the `control_enable` service changes the live gate.
-- `enable_interval` has no launch argument; set it in the parameter file.
+
+## Launch arguments
+
+`head.launch.py` takes each parameter above except `enable_interval` as a launch argument of the same name, plus:
+
+| Argument | Default | Description |
+|---|---|---|
+| `namespace` | `head` | Node namespace |
+| `params_file` | `config/head_ros.yaml` | Node parameter file |
+
+- Parameter arguments default to empty, which keeps the value from `params_file`.
+- `control_enabled`, `auto_configure` and `auto_enable` take `true` or `false`; `control_mode` takes `pos` or `mit`.
+
+## Commands and feedback
+
+Rules for messages on `control/joint_states`:
+
+- `name` and `position` must be nonempty, the same length and free of duplicates. Subsets are allowed; unknown joints are skipped.
+- Used values must be finite; an invalid message is rejected as a whole. A failed write is logged and other joints continue.
+- `pos` mode uses `position` only. `mit` mode also uses `velocity` and `effort`; each must be empty (zeros) or match the `name` length.
+- Headers are ignored; there is no age check or acknowledgment.
+
+Joints without SDK state are left out of `feedback/joint_states`.
+
+For MIT control, switch the mode, then send position (rad), velocity (rad/s) and effort (N·m). Gains come from the hardware YAML.
+
+```bash
+ros2 param set /head/head_node control_mode mit
+ros2 topic pub --once /head/control/joint_states sensor_msgs/msg/JointState \
+  "{name: ['head_joint1'], position: [0.0], velocity: [0.0], effort: [0.0]}"
+```
 
 ## Hardware YAML
 
@@ -69,3 +99,10 @@ This limits current through a calibrated factor and does not guarantee measured 
 - Node exit closes the SDK connection without disabling the motors.
 - The `enable` service reports the SDK result; read `motor_status` for the hardware state.
 - Watchdogs, trajectory execution and fault recovery belong upstream of this driver.
+
+## Troubleshooting
+
+- `head YAML not found`: pass an absolute `yaml_path`, or a file name installed under `share/head_ros/config`.
+- `head configure failed` or `head enable failed`: check power, wiring and node IDs, then run the [connection check](../README.md#quick-start).
+- Log says `control/joint_states ignored`: fix the message as described in [Commands and feedback](#commands-and-feedback).
+- `motor_status` entries are `STALE`: no fresh feedback within `status_timeout`; check power and CAN.

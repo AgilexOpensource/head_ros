@@ -2,7 +2,7 @@
 
 [English](reference.md)
 
-`head_node` 的参数、硬件 YAML、诊断和运行边界。入门请先看 [README](../README.zh-CN.md)。
+`head_node` 的参数、启动参数、指令规则、硬件 YAML、诊断、运行边界和常见问题。入门请先看 [README](../README.zh-CN.md)。
 
 ## ROS 参数
 
@@ -23,7 +23,37 @@
 - 频率和 `status_timeout` 必须有限且大于 0；`enable_interval` 必须有限且不小于 0。
 - 除 `control_mode` 外，所有参数在启动后只读。
 - `control_enabled` 保持启动值；`control_enable` 服务修改实际门控。
-- `enable_interval` 没有对应的启动参数，请在参数文件中设置。
+
+## 启动参数
+
+`head.launch.py` 为上表中除 `enable_interval` 外的每个参数提供同名启动参数，另有：
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `namespace` | `head` | 节点命名空间 |
+| `params_file` | `config/head_ros.yaml` | 节点参数文件 |
+
+- 参数类启动参数默认为空，留空则使用 `params_file` 中的值。
+- `control_enabled`、`auto_configure` 和 `auto_enable` 取 `true` 或 `false`；`control_mode` 取 `pos` 或 `mit`。
+
+## 指令与反馈
+
+`control/joint_states` 消息的规则：
+
+- `name` 和 `position` 必须非空、长度相同且无重复。可以只发部分关节；未知关节会被跳过。
+- 用到的值必须有限；无效消息整条拒绝。单个关节写入失败会记录日志，其他关节继续执行。
+- `pos` 模式只用 `position`。`mit` 模式还用 `velocity` 和 `effort`；二者各自为空（按 0 处理）或与 `name` 等长。
+- 忽略消息头；不检查时效，也没有应答。
+
+没有 SDK 状态的关节不出现在 `feedback/joint_states` 中。
+
+MIT 控制：先切换模式，再发送位置（rad）、速度（rad/s）和力矩（N·m）。增益来自硬件 YAML。
+
+```bash
+ros2 param set /head/head_node control_mode mit
+ros2 topic pub --once /head/control/joint_states sensor_msgs/msg/JointState \
+  "{name: ['head_joint1'], position: [0.0], velocity: [0.0], effort: [0.0]}"
+```
 
 ## 硬件 YAML
 
@@ -69,3 +99,10 @@ current_a = torque_limit / (torque_k * torque_b)
 - 节点退出时关闭 SDK 连接，但不失能电机。
 - `enable` 服务返回 SDK 的结果；硬件实际状态请看 `motor_status`。
 - 看门狗、轨迹执行和故障恢复应由本驱动的上层负责。
+
+## 常见问题
+
+- `head YAML not found`：传入绝对路径的 `yaml_path`，或安装在 `share/head_ros/config` 下的文件名。
+- `head configure failed` 或 `head enable failed`：检查供电、接线和节点 ID，再运行[连接检查](../README.zh-CN.md#快速开始)。
+- 日志显示 `control/joint_states ignored`：按[指令与反馈](#指令与反馈)中的规则修正消息。
+- `motor_status` 条目为 `STALE`：`status_timeout` 内没有新的反馈；检查供电和 CAN。
