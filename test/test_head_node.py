@@ -112,7 +112,9 @@ def publish_status(module, feedbacks):
         SimpleNamespace(
             can_channel="can%d" % index,
             node_id=index + 1,
-            get_low_speed_feedback=lambda feedback=feedback: feedback,
+            get_low_speed_feedback=(
+                feedback if callable(feedback) else (lambda feedback=feedback: feedback)
+            ),
         )
         for index, feedback in enumerate(feedbacks)
     ]
@@ -156,6 +158,18 @@ def test_timeout_boundary_is_valid(head_node):
     status = publish_status(head_node, [make_feedback(False, 8_000_000_000)])[0]
     assert status.level == DiagnosticStatus.OK
     assert status.values[0].value == "false"
+
+
+def test_frame_cached_during_publish_is_fresh(head_node, monkeypatch):
+    clock = [10_000_000_000]
+    monkeypatch.setattr(head_node.time, "time_ns", lambda: clock[0])
+
+    def receive_then_read():
+        clock[0] += 1_000
+        return make_feedback(True, clock[0])
+
+    statuses = publish_status(head_node, [receive_then_read, receive_then_read])
+    assert [status.level for status in statuses] == [DiagnosticStatus.OK] * 2
 
 
 def test_empty_module_still_publishes(head_node):

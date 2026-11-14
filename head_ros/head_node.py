@@ -279,7 +279,6 @@ class HeadRosNode(Node):
     def _publish_status(self) -> None:
         msg = DiagnosticArray()
         msg.header.stamp = self.get_clock().now().to_msg()
-        now_ns = time.time_ns()
         fault_fields = (
             "undervoltage", "motor_overtemp", "driver_overcurrent",
             "driver_overtemp", "collision_tripped", "driver_error", "stall_tripped",
@@ -300,7 +299,8 @@ class HeadRosNode(Node):
             values["control_mode"] = self._control_mode
             feedback = motor.get_low_speed_feedback()
             if feedback is not None:
-                age = (now_ns - feedback.timestamp_ns) / 1e9
+                # Read the clock after the cache; the CAN thread may update it at any time.
+                age = (time.time_ns() - feedback.timestamp_ns) / 1e9
                 if feedback.timestamp_ns > 0 and 0.0 <= age <= self._status_timeout:
                     values["enabled"] = str(feedback.status.enabled).lower()
                     faults = []
