@@ -44,6 +44,7 @@ Rules for messages on `control/joint_states`:
 - Used values must be finite; an invalid message is rejected as a whole. A failed write is logged and other joints continue.
 - `pos` mode uses `position` only. `mit` mode also uses `velocity` and `effort`; each must be empty (zeros) or match the `name` length.
 - Headers are ignored; there is no age check or acknowledgment.
+- A joint is only commanded while fresh low-speed feedback (within `status_timeout`) reports its motor enabled; otherwise its target is dropped with one warning until it is enabled again.
 
 Joints without SDK state are left out of `feedback/joint_states`.
 

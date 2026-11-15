@@ -222,17 +222,27 @@ def test_expired_fault_and_numeric_fields_are_unknown(head_node):
         assert values[name] == "unknown"
 
 
-def make_control_node(module, mode="pos", enabled=True):
+def make_control_node(module, mode="pos", enabled=True, motors_enabled=None):
+    """``enabled``: command gate; ``motors_enabled``: joint index -> motor enabled (default all)."""
     commands = []
     warnings = []
+    motors_enabled = {0: True, 1: True} if motors_enabled is None else motors_enabled
     node = module.HeadRosNode.__new__(module.HeadRosNode)
     node._control_mode = mode
     node._control_enabled = enabled
     node._control_gate_block_logged = False
+    node._disabled_logged = set()
+    node._status_timeout = 2.0
     node._joint_by_name = {"joint1": 0, "joint2": 1}
+
+    def motor(index):
+        feedback = make_feedback(motors_enabled[index], 9_000_000_000)   # 1 s old at the fixture clock
+        return SimpleNamespace(get_low_speed_feedback=lambda: feedback)
+
     node._group = SimpleNamespace(
         set_target_position=lambda *args: commands.append(("pos", args)) or True,
         set_mit=lambda *args: commands.append(("mit", args)) or True,
+        motor=motor,
     )
     node.get_logger = lambda: SimpleNamespace(
         warn=warnings.append, debug=lambda message: None, info=lambda message: None
@@ -291,6 +301,28 @@ def test_mit_velocity_and_torque_forwarded(head_node):
     ))
     assert commands == [("mit", (1, 0.2, 0.3, 0.4))]
     assert warnings == []
+
+
+@pytest.mark.parametrize("mode", ["pos", "mit"])
+def test_disabled_motor_command_dropped_until_enabled(head_node, mode):
+    motors_enabled = {0: False, 1: True}
+    node, commands, warnings = make_control_node(head_node, mode, motors_enabled=motors_enabled)
+    for position in (0.1, 0.2):
+        node._on_control(SimpleNamespace(
+            name=["joint1", "joint2"], position=[position, position], velocity=[], effort=[]
+        ))
+    assert [args[0] for _, args in commands] == [1, 1]
+    assert len(warnings) == 1 and "joint1" in warnings[0]   # warned once
+    motors_enabled[0] = True
+    node._on_control(SimpleNamespace(name=["joint1"], position=[0.3], velocity=[], effort=[]))
+    assert commands[-1][1][:2] == (0, 0.3)
+
+
+def test_stale_feedback_counts_as_disabled(head_node, monkeypatch):
+    node, commands, warnings = make_control_node(head_node)
+    monkeypatch.setattr(head_node.time, "time_ns", lambda: 11_500_000_000)   # feedback 2.5 s old
+    node._on_control(SimpleNamespace(name=["joint1"], position=[0.1], velocity=[], effort=[]))
+    assert commands == []
 
 
 def test_closed_gate_drops_commands(head_node):

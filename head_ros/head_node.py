@@ -5,7 +5,7 @@ import math
 import os
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 
 import rclpy
 import yaml
@@ -146,6 +146,7 @@ class HeadRosNode(Node):
         )
         self._control_enabled = bool(self.get_parameter("control_enabled").value)
         self._control_gate_block_logged = False
+        self._disabled_logged: Set[str] = set()
 
         config_path = resolve_yaml_path(yaml_path)
         module_key = resolve_module_key(
@@ -373,6 +374,14 @@ class HeadRosNode(Node):
                 self.get_logger().debug("skip unknown joint: %s" % name)
                 continue
 
+            if not self._motor_enabled(index):
+                # Same guard as fold/lift: targets wait for the enable service instead of reaching a
+                # disabled motor.
+                if name not in self._disabled_logged:
+                    self.get_logger().warn("control/joint_states ignored for %s: motor not enabled" % name)
+                    self._disabled_logged.add(name)
+                continue
+            self._disabled_logged.discard(name)
             position = self._safe_get(msg.position, idx)
             if self._control_mode == CONTROL_MODE_MIT:
                 velocity = self._safe_get(msg.velocity, idx)
@@ -383,6 +392,19 @@ class HeadRosNode(Node):
             else:
                 if not self._group.set_target_position(index, position):
                     self.get_logger().warn("set_target_position failed for %s" % name)
+
+    def _motor_enabled(self, index: int) -> bool:
+        """True when fresh low-speed feedback reports the motor enabled."""
+        motor = self._group.motor(index)
+        feedback = motor.get_low_speed_feedback()
+        if feedback is None or feedback.timestamp_ns <= 0:
+            return False
+        age = (time.time_ns() - feedback.timestamp_ns) / 1e9
+        if not 0.0 <= age <= self._status_timeout:
+            return False
+        if getattr(motor, "protocol", "arm") == "rb200":
+            return bool(feedback.status.operation_enabled)
+        return bool(feedback.status.enabled)
 
     def _on_control_enable(
         self, request: SetBool.Request, response: SetBool.Response
