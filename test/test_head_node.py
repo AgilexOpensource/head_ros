@@ -373,7 +373,7 @@ def test_startup_defaults_timers_and_readonly_contract(head_node, monkeypatch):
     for name in (
         "yaml_path", "module_key", "can_channel", "auto_configure", "auto_enable",
         "feedback_rate", "status_rate", "status_timeout", "control_enabled",
-        "enable_interval",
+        "enable_interval", "feedback_timeout",
     ):
         assert node.descriptors[name].read_only
     assert node.descriptors["control_mode"] is None
@@ -392,6 +392,14 @@ def test_enable_interval_override_used_at_startup(head_node, monkeypatch):
     calls = prepare_startup(head_node, monkeypatch, {"enable_interval": 0.0})
     head_node.HeadRosNode()
     assert calls == ["connect", "configure", "enable:0.0"]
+
+
+@pytest.mark.parametrize("invalid", [-0.1, float("nan"), float("inf")])
+def test_invalid_feedback_timeout_rejected_before_can(head_node, monkeypatch, invalid):
+    calls = prepare_startup(head_node, monkeypatch, {"feedback_timeout": invalid})
+    with pytest.raises(ValueError, match="feedback_timeout"):
+        head_node.HeadRosNode()
+    assert calls == []
 
 
 @pytest.mark.parametrize("invalid", [-0.1, float("nan"), float("inf")])
@@ -551,3 +559,55 @@ def test_pos_ignores_velocity_and_effort(head_node):
 def test_overflowing_current_conversion_rejected(head_node):
     with pytest.raises(ValueError, match="converted current"):
         head_node.torque_limit_to_current_a(1e308, 1e-308, 1.0)
+
+
+def make_feedback_node(module, cls, stamps, timeout=0.5):
+    """Node with one joint per entry in ``stamps`` (high-speed feedback timestamp, ns)."""
+    module.JointState = lambda: SimpleNamespace(header=SimpleNamespace())
+    node = cls.__new__(cls)
+    node._feedback_timeout = timeout
+    node._stale_joints = set()
+    node._joint_names = ["joint%d" % i for i in range(len(stamps))]
+    published, logs = [], []
+    node._feedback_pub = SimpleNamespace(publish=published.append)
+    node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(to_msg=lambda: None))
+    node.get_logger = lambda: SimpleNamespace(warn=logs.append, info=logs.append)
+
+    def motor(index):
+        stamp = stamps[index]
+        feedback = None if stamp is None else SimpleNamespace(timestamp_ns=stamp)
+        return SimpleNamespace(get_high_speed_feedback=lambda: feedback)
+
+    def get_state(index):
+        return SimpleNamespace(position_rad=0.1 * index, velocity_rad_s=0.0, torque_nm=0.0)
+
+    node._group = SimpleNamespace(joint_count=len(stamps), motor=motor, get_state=get_state)
+    return node, published, logs
+
+
+def test_feedback_older_than_timeout_is_not_published(head_node):
+    # time_ns is 10 s; joint1 is 0.6 s old; joint2 and joint3 have no usable stamp, so cannot be judged
+    stamps = [9_600_000_000, 9_400_000_000, 0, None]
+    node, published, logs = make_feedback_node(head_node, head_node.HeadRosNode, stamps)
+    node._publish_feedback()
+    assert published[-1].name == ["joint0", "joint2", "joint3"]
+    assert logs == ["joint1 feedback older than 0.50 s, not published"]
+    node._publish_feedback()
+    assert len(logs) == 1
+
+
+def test_feedback_timeout_zero_publishes_cached_samples(head_node):
+    node, published, _ = make_feedback_node(head_node, head_node.HeadRosNode, [1, 1], timeout=0.0)
+    node._publish_feedback()
+    assert published[-1].name == ["joint0", "joint1"]
+
+
+def test_stale_joint_is_published_again_once_fresh(head_node):
+    stamps = [9_000_000_000]
+    node, published, logs = make_feedback_node(head_node, head_node.HeadRosNode, stamps)
+    node._publish_feedback()
+    assert published == []
+    stamps[0] = 10_000_000_000
+    node._publish_feedback()
+    assert published[-1].name == ["joint0"]
+    assert logs[-1] == "joint0 feedback recovered"
