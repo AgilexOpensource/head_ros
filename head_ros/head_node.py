@@ -24,6 +24,12 @@ CONTROL_MODE_POS = "pos"
 CONTROL_MODE_MIT = "mit"
 
 
+MOTOR_FAULT_FIELDS = (
+    "undervoltage", "motor_overtemp", "driver_overcurrent",
+    "driver_overtemp", "collision_tripped", "driver_error", "stall_tripped",
+)
+
+
 def load_torque_limit_by_joint(config_path: Path, module_key: str) -> Dict[str, float]:
     """Read per-joint ``torque_limit`` [N·m]; joints without it are omitted."""
     with config_path.open(encoding="utf-8") as handle:
@@ -143,6 +149,10 @@ class HeadRosNode(Node):
         if not math.isfinite(self._feedback_timeout) or self._feedback_timeout < 0.0:
             raise ValueError("feedback_timeout must be finite and >= 0")
         self._stale_joints: Set[str] = set()
+        self._recovered: Dict[int, int] = {}
+        self._recover_after = 0.0
+        self._restoring: Set[int] = set()
+        self._withheld: Dict[int, float] = {}
         self._enable_interval = float(self.get_parameter("enable_interval").value)
         if not math.isfinite(self._enable_interval) or self._enable_interval < 0.0:
             raise ValueError("enable_interval must be finite and >= 0")
@@ -157,6 +167,7 @@ class HeadRosNode(Node):
         module_key = resolve_module_key(
             str(self.get_parameter("module_key").value), config_path
         )
+        self._config_path, self._module_key = config_path, module_key
         self._group = JointGroup.from_yaml(str(config_path), module_key, can_channel)
 
         self._joint_by_name: Dict[str, int] = {
@@ -173,6 +184,8 @@ class HeadRosNode(Node):
                 self._apply_torque_limits(config_path, module_key)
             if self._auto_enable and not self._group.enable(self._enable_interval):
                 raise RuntimeError("head enable failed")
+            self._enable_wanted = self._auto_enable
+            self._recover_after = time.monotonic() + 1.0
         except Exception:
             try:
                 self._group.close()
@@ -285,10 +298,7 @@ class HeadRosNode(Node):
     def _publish_status(self) -> None:
         msg = DiagnosticArray()
         msg.header.stamp = self.get_clock().now().to_msg()
-        fault_fields = (
-            "undervoltage", "motor_overtemp", "driver_overcurrent",
-            "driver_overtemp", "collision_tripped", "driver_error", "stall_tripped",
-        )
+        fault_fields = MOTOR_FAULT_FIELDS
         numeric_fields = (
             "bus_voltage_v", "driver_temp_deg", "motor_temp_deg", "bus_current", "status_raw",
         )
@@ -327,6 +337,7 @@ class HeadRosNode(Node):
             status.values = [KeyValue(key=key, value=value) for key, value in values.items()]
             msg.status.append(status)
         self._status_pub.publish(msg)
+        self._restore_enable()
 
     def _publish_feedback(self) -> None:
         msg = JointState()
@@ -338,7 +349,7 @@ class HeadRosNode(Node):
 
         for index in range(self._group.joint_count):
             state = self._group.get_state(index)
-            if state is None or not self._feedback_fresh(index):
+            if state is None or not self._feedback_fresh(index) or index in self._withheld:
                 continue
             msg.name.append(self._joint_names[index])
             msg.position.append(state.position_rad)
@@ -366,6 +377,9 @@ class HeadRosNode(Node):
             self.get_logger().warn("%s feedback older than %.2f s, not published" % (name, self._feedback_timeout))
         elif fresh and name in self._stale_joints:
             self._stale_joints.discard(name)
+            self._recovered[index] = time.time_ns()
+            if self._enable_wanted:
+                self._withheld.setdefault(index, time.monotonic())
             self.get_logger().info("%s feedback recovered" % name)
         return fresh
 
@@ -398,6 +412,8 @@ class HeadRosNode(Node):
             index = self._joint_by_name.get(name)
             if index is None or index == JointGroup.INVALID_JOINT_INDEX:
                 self.get_logger().debug("skip unknown joint: %s" % name)
+                continue
+            if index in self._withheld:
                 continue
 
             if not self._motor_enabled(index):
@@ -443,12 +459,74 @@ class HeadRosNode(Node):
         self.get_logger().info(response.message)
         return response
 
+    def _restore_enable(self) -> None:
+        """Re-configure and re-enable joints disabled without a fault while enabling is wanted."""
+        if not self._enable_wanted:
+            self._recovered.clear()
+            self._restoring.clear()
+            self._withheld.clear()
+            return
+        now = time.monotonic()
+        lost = []
+        for index in range(len(self._joint_names)):
+            name = self._joint_names[index]
+            if name in self._stale_joints:
+                continue
+            motor = self._group.motor(index)
+            feedback = motor.get_low_speed_feedback()
+            if feedback is None or feedback.timestamp_ns < self._recovered.get(index, 1):
+                continue
+            if (time.time_ns() - feedback.timestamp_ns) / 1e9 > self._status_timeout:
+                continue
+            if self._motor_enabled(index):
+                self._recovered.pop(index, None)
+                if index in self._restoring:
+                    self._restoring.discard(index)
+                    self.get_logger().info("%s re-enabled" % name)
+                since = self._withheld.get(index)
+                if since is not None and now - since >= self._feedback_timeout:
+                    del self._withheld[index]
+            elif self._motor_faulted(motor, feedback):
+                self._withheld.pop(index, None)
+            else:
+                self._withheld.setdefault(index, now)
+                lost.append(index)
+        if not lost or now < self._recover_after:
+            return
+        self._recover_after = now + 1.0
+        names = ", ".join(self._joint_names[index] for index in lost)
+        if not self._restoring.issuperset(lost):
+            self.get_logger().warn("%s disabled without a fault, re-enabling" % names)
+        self._restoring.update(lost)
+        try:
+            if self._auto_configure:
+                for index in lost:
+                    if not self._group.motor(index).configure():
+                        raise RuntimeError("configure failed")
+                self._apply_torque_limits(self._config_path, self._module_key)
+            if not self._group.enable(self._enable_interval):
+                raise RuntimeError("enable failed")
+        except Exception as exc:
+            self.get_logger().warn("re-enable of %s failed (%s), retrying in 1 s" % (names, exc))
+            return
+
+    @staticmethod
+    def _motor_faulted(motor, feedback) -> bool:
+        if getattr(motor, "protocol", "arm") == "rb200":
+            return bool(feedback.status.fault)
+        return any(getattr(feedback.status, name) for name in MOTOR_FAULT_FIELDS)
+
     def _on_enable(self, request: SetBool.Request, response: SetBool.Response) -> SetBool.Response:
+        if not request.data:
+            self._enable_wanted = False
         ok = (
             self._group.enable(self._enable_interval)
             if request.data
             else self._group.disable(self._enable_interval)
         )
+        if request.data and ok:
+            self._enable_wanted = True
+            self._recover_after = time.monotonic() + 1.0
         response.success = ok
         response.message = "enabled" if request.data else "disabled"
         if not ok:

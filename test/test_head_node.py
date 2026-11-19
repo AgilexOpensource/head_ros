@@ -120,6 +120,8 @@ def publish_status(module, feedbacks):
     ]
     published = []
     node = module.HeadRosNode.__new__(module.HeadRosNode)
+    node._recovered, node._recover_after, node._enable_wanted = {}, 0.0, True
+    node._restoring, node._stale_joints, node._withheld = set(), set(), {}
     node._group = SimpleNamespace(joint_count=len(motors), motor=motors.__getitem__)
     node._joint_names = ["joint%d" % (index + 1) for index in range(len(motors))]
     node._status_timeout = 2.0
@@ -228,6 +230,8 @@ def make_control_node(module, mode="pos", enabled=True, motors_enabled=None):
     warnings = []
     motors_enabled = {0: True, 1: True} if motors_enabled is None else motors_enabled
     node = module.HeadRosNode.__new__(module.HeadRosNode)
+    node._recovered, node._recover_after, node._enable_wanted = {}, 0.0, True
+    node._restoring, node._stale_joints, node._withheld = set(), set(), {}
     node._control_mode = mode
     node._control_enabled = enabled
     node._control_gate_block_logged = False
@@ -565,6 +569,8 @@ def make_feedback_node(module, cls, stamps, timeout=0.5):
     """Node with one joint per entry in ``stamps`` (high-speed feedback timestamp, ns)."""
     module.JointState = lambda: SimpleNamespace(header=SimpleNamespace())
     node = cls.__new__(cls)
+    node._recovered, node._recover_after, node._enable_wanted = {}, 0.0, True
+    node._restoring, node._stale_joints, node._withheld = set(), set(), {}
     node._feedback_timeout = timeout
     node._stale_joints = set()
     node._joint_names = ["joint%d" % i for i in range(len(stamps))]
@@ -602,12 +608,155 @@ def test_feedback_timeout_zero_publishes_cached_samples(head_node):
     assert published[-1].name == ["joint0", "joint1"]
 
 
-def test_stale_joint_is_published_again_once_fresh(head_node):
+def test_stale_joint_is_published_again_once_released(head_node):
     stamps = [9_000_000_000]
     node, published, logs = make_feedback_node(head_node, head_node.HeadRosNode, stamps)
     node._publish_feedback()
     assert published == []
     stamps[0] = 10_000_000_000
     node._publish_feedback()
-    assert published[-1].name == ["joint0"]
+    assert published == [] and 0 in node._withheld
     assert logs[-1] == "joint0 feedback recovered"
+    node._withheld.clear()
+    node._publish_feedback()
+    assert published[-1].name == ["joint0"]
+
+
+def make_restore_node(module, monkeypatch, enabled=False, status_ns=10_100_000_000, recovered=True):
+    calls = []
+    clock = [100.0]
+    monkeypatch.setattr(module.time, "time_ns", lambda: 10_200_000_000)
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    bits = dict.fromkeys(module.MOTOR_FAULT_FIELDS, False)
+    status = SimpleNamespace(status=SimpleNamespace(enabled=enabled, **bits), timestamp_ns=status_ns)
+    node = module.HeadRosNode.__new__(module.HeadRosNode)
+    node._recovered = {0: 10_000_000_000} if recovered else {}
+    node._recover_after, node._enable_wanted, node._restoring = 0.0, True, set()
+    node._withheld, node._feedback_timeout = {}, 0.5
+    node._joint_names = ["joint0"]
+    node._stale_joints = set()
+    node._auto_configure = True
+    node._status_timeout = 2.0
+    node._config_path, node._module_key = None, None
+    node._apply_torque_limits = lambda path, key: calls.append("limits")
+    node._enable_interval = 0.1
+    motor = SimpleNamespace(protocol="arm", get_low_speed_feedback=lambda: status,
+                            configure=lambda: calls.append("configure") or True)
+    node._group = SimpleNamespace(
+        motor=lambda index: motor,
+        enable=lambda interval=0.0: calls.append("enable") or node.enable_ok,
+    )
+    node.enable_ok = True
+    node.logs = []
+    node.get_logger = lambda: SimpleNamespace(info=node.logs.append, warn=node.logs.append)
+    return node, status, calls, clock
+
+
+def test_power_loss_reconfigures_and_restores_a_wanted_enable(head_node, monkeypatch):
+    node, status, calls, clock = make_restore_node(head_node, monkeypatch)
+    node._restore_enable()
+    assert calls == ["configure", "limits", "enable"]
+    node._restore_enable()
+    assert calls == ["configure", "limits", "enable"]
+    status.status.enabled = True
+    clock[0] += 1.0
+    node._restore_enable()
+    assert node._recovered == {} and node._restoring == set()
+    assert node.logs[-1] == "joint0 re-enabled"
+
+
+def test_power_loss_keeps_a_disabled_module_disabled(head_node, monkeypatch):
+    node, _, calls, _ = make_restore_node(head_node, monkeypatch)
+    node._position_mode_sent = {"joint0": True}
+    node._group.disable = lambda interval=0.0: False
+    node._on_enable(SimpleNamespace(data=False), SimpleNamespace())
+    calls.clear()
+    node._restore_enable()
+    assert calls == [] and node._recovered == {}
+
+
+def test_restore_waits_for_reconnect_then_a_status_sent_after_it(head_node, monkeypatch):
+    node, status, calls, _ = make_restore_node(head_node, monkeypatch, status_ns=9_500_000_000)
+    node._stale_joints = {"joint0"}
+    node._recovered = {}
+    node._restore_enable()
+    assert calls == []
+    node._stale_joints = set()
+    node._recovered = {0: 10_000_000_000}
+    node._restore_enable()
+    assert calls == []
+    status.timestamp_ns = 10_100_000_000
+    node._restore_enable()
+    assert calls[-1] == "enable" and "configure" in calls
+
+
+def test_estop_release_reconfigures_and_enables(head_node, monkeypatch):
+    node, status, calls, clock = make_restore_node(head_node, monkeypatch, recovered=False)
+    status.status.stall_tripped = True
+    node._restore_enable()
+    assert calls == []
+    status.status.stall_tripped = False
+    node._restore_enable()
+    assert calls[0] == "configure" and calls[-1] == "enable"
+
+
+def test_rb200_fault_is_not_re_enabled(head_node, monkeypatch):
+    node, status, calls, _ = make_restore_node(head_node, monkeypatch, recovered=False)
+    node._group.motor(0).protocol = "rb200"
+    status.status = SimpleNamespace(operation_enabled=False, fault=True)
+    node._restore_enable()
+    assert calls == []
+    status.status.fault = False
+    node._restore_enable()
+    assert calls[-1] == "enable"
+
+
+def test_unconfirmed_restore_retries_after_a_second_and_warns_once(head_node, monkeypatch):
+    node, _, calls, clock = make_restore_node(head_node, monkeypatch, recovered=False)
+    node.enable_ok = False
+    node._restore_enable()
+    node._restore_enable()
+    assert calls.count("enable") == 1
+    clock[0] += 1.0
+    node.enable_ok = True
+    node._restore_enable()
+    clock[0] += 1.0
+    node._restore_enable()
+    assert calls.count("enable") == 3
+    assert sum("re-enabling" in log for log in node.logs) == 1
+
+
+def test_restoring_joint_is_withheld_until_enabled_for_feedback_timeout(head_node, monkeypatch):
+    node, status, calls, clock = make_restore_node(head_node, monkeypatch, recovered=False)
+    node._restore_enable()
+    assert node._withheld == {0: 100.0} and calls[-1] == "enable"
+    status.status.enabled = True
+    clock[0] += 0.3
+    node._restore_enable()
+    assert 0 in node._withheld
+    clock[0] += 0.2
+    node._restore_enable()
+    assert node._withheld == {}
+
+
+def test_faulted_joint_feedback_is_not_withheld(head_node, monkeypatch):
+    node, status, _, _ = make_restore_node(head_node, monkeypatch, recovered=False)
+    node._restore_enable()
+    status.status.stall_tripped = True
+    node._restore_enable()
+    assert node._withheld == {}
+
+
+def test_manual_disable_releases_withheld_feedback(head_node, monkeypatch):
+    node, _, _, _ = make_restore_node(head_node, monkeypatch, recovered=False)
+    node._restore_enable()
+    node._enable_wanted = False
+    node._restore_enable()
+    assert node._withheld == {}
+
+
+def test_withheld_joint_drops_targets(head_node):
+    node, commands, _ = make_control_node(head_node)
+    node._withheld = {0: 0.0}
+    node._on_control(SimpleNamespace(name=["joint1", "joint2"], position=[0.1, 0.2], velocity=[], effort=[]))
+    assert commands == [("pos", (1, 0.2))]
